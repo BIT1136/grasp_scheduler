@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="grasp_planner" type="node.py" name="grasp_planner_server" output="screen"/>
+</launch>
