@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>grasp_planner</name>
+  <name>grasp_scheduler</name>
   <version>1.0.0</version>
   <description>TODO</description>
   <maintainer email="todo@todo.todo">TODO</maintainer>

@@ -1,0 +1,4 @@
+<launch>
+    <include file="$(find grcnn)/launch/grasp_planner.launch"/>
+    <node pkg="grasp_scheduler" type="grasp_scheduler_server.py" name="grasp_scheduler_server" output="screen"/>
+</launch>
