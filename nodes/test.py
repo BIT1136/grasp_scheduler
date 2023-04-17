@@ -12,11 +12,11 @@ class A(smach.State):
                              input_keys=['list'])
 
     def execute(self, userdata):
-        rospy.loginfo(userdata.sm_counter)
+        # rospy.loginfo(userdata.sm_counter)
         print(userdata.list)
         userdata.list.pop()
         if userdata.sm_counter < 3:
-            userdata.sm_counter = userdata.sm_counter + 1
+            userdata.sm_counter +=1
             return 'outcome1'
         else:
             return 'outcome2'

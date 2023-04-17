@@ -25,12 +25,12 @@ class GraspSchedulerServer:
             smach.StateMachine.add(
                 "LookDown",
                 LookDown(),
-                transitions={"enough": "Pnp", "not_enough": "LookSide"},
+                transitions={"enough": "Pnp", "not_enough": "LookSide","aborted":"aborted"},
             )
             smach.StateMachine.add(
                 "LookSide",
                 LookSide(),
-                transitions={"enough": "Pnp", "not_enough": "LookSide"},
+                transitions={"enough": "Pnp", "not_enough": "LookSide","aborted":"aborted"},
             )
             smach.StateMachine.add(
                 "Pnp",
@@ -40,12 +40,7 @@ class GraspSchedulerServer:
             smach.StateMachine.add(
                 "FindChange",
                 FindChange(),
-                transitions={"change": "LookDown", "not_change": "AsIsPnp","empty":"successed"},
-            )
-            smach.StateMachine.add(
-                "AsIsPnp",
-                AsIsPnp(),
-                transitions={"successed": "FindChange", "failed": "FailHandler"},
+                transitions={"change": "LookDown", "not_change": "Pnp","empty":"successed"},
             )
             smach.StateMachine.add(
                 "FailHandler",

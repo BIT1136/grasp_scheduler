@@ -13,9 +13,16 @@ class ObjectInfo:
     def __init__(self):
         self.obj_dict = {}
         self.grasp_type_count = {}
+        self.roi_center=None
 
     def new_object(self, obj_id, obj_type):
         self.obj_dict[obj_id] = {"id": obj_id, "obj_type": obj_type, "grasp_plans": []}
+
+    def add_object_mask(self,obj_id,obj_mask):
+        # 俯视图中物体对应像素为True
+        if obj_id not in self.obj_dict:
+            raise Exception
+        self.obj_dict[obj_id]["obj_mask"] = obj_mask
 
     def add_object_pointcloud(self, obj_id, point_cloud):
         if obj_id not in self.obj_dict:
@@ -66,6 +73,7 @@ class ObjectInfo:
         best_plan = None
         best_obj_id = None
         best_obj_type = None
+        best_obj_mask=None
         for obj_id, obj_info in self.obj_dict.items():
             if obj_info.get("obj_type") != obj_type:
                 continue
@@ -78,11 +86,12 @@ class ObjectInfo:
                     best_plan = plan
                     best_obj_id = obj_id
                     best_obj_type = obj_info.get("obj_type")
+                    best_obj_mask=obj_info.get("obj_mask")
         if best_obj_id is None:
-            return None
+            return None,None
         del self.obj_dict[best_obj_id]
         self.grasp_type_count[best_obj_type] -= 1
-        return best_plan
+        return best_plan, best_obj_mask
 
     def find_object_by_position(self, position):
         for obj_id, obj_info in self.obj_dict.items():
