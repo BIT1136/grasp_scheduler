@@ -8,19 +8,17 @@ find_package(catkin REQUIRED COMPONENTS
 
 catkin_python_setup()
 
-add_message_files(
-  FILES
-  mymsg.msg
-)
+# add_message_files(
+#   FILES
+# )
 
-add_service_files(
-  FILES
-  mysrv.srv
-)
+# add_service_files(
+#   FILES
+# )
 
-generate_messages(
-  DEPENDENCIES
-)
+# generate_messages(
+#   DEPENDENCIES
+# )
 
 catkin_package(
 )

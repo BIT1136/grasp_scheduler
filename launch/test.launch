@@ -1,4 +1,7 @@
 <launch>
+    <!-- <node pkg="rviz" type="rviz" name="rviz"/> -->
+    <include file="$(find maskrcnn_ros)/launch/node.launch"/>
     <include file="$(find grcnn)/launch/grasp_planner.launch"/>
+    <include file="$(find vgn)/launch/vgn_server.launch"/>
     <node pkg="grasp_scheduler" type="grasp_scheduler_server.py" name="grasp_scheduler_server" output="screen"/>
 </launch>
