@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import time
+
 import rospy
 import smach
 import smach_ros
@@ -9,14 +11,14 @@ from states import *
 from ros_interface import ROSInterface
 
 
-# TODO grcnn to common grasprequest
-
-
 class GraspSchedulerServer:
     def __init__(self, sim=True) -> None:
         sm = smach.StateMachine(outcomes=["successed", "aborted"])
         sm.userdata.perfer_type = [1, 2, 3]
         ROSInterface().set_sim(True)
+        time.sleep(.5)#否则无法清除rviz中的marker
+        ROSInterface().clear_markers()
+        ROSInterface().vgn_reset()
         self.sis = smach_ros.IntrospectionServer("grasp_planner_server", sm, "/SM_ROOT")
         self.sis.start()
         with sm:
@@ -44,7 +46,7 @@ class GraspSchedulerServer:
             smach.StateMachine.add(
                 "Pnp",
                 Pnp(),
-                transitions={"successed": "FindChange", "failed": "FailHandler"},
+                transitions={"successed": "FindChange", "failed": "FailHandler","aborted": "aborted",},
             )
             smach.StateMachine.add(
                 "FindChange",

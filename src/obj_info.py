@@ -19,42 +19,39 @@ class ObjectInfo:
             return
         self.init = True
         self.obj_dict = {}
-        self.grasp_type_count = {}
+        self.grasp_type_count = {}#每个类型有几个可抓取的物体
         self.roi_center = None
 
     def new_object(self, obj_id, obj_type):
-        print("new object: ", obj_id, obj_type)
+        print("新物体id=", obj_id, " 类型=",obj_type)
         self.obj_dict[obj_id] = {"obj_type": obj_type, "grasp_plans": []}
 
     def add_object_mask(self, obj_id, obj_mask):
-        print("add object mask: ", obj_id)
+        print("添加mask到物体: ", obj_id)
         # 俯视图中物体对应像素为True
         if obj_id not in self.obj_dict:
             raise Exception
         self.obj_dict[obj_id]["obj_mask"] = obj_mask
 
     def add_object_pointcloud(self, obj_id, point_cloud):
-        print("add object pointcloud: ", obj_id)
+        print("添加点云到物体: ", obj_id)
         if obj_id not in self.obj_dict:
             raise Exception
         self.obj_dict[obj_id]["point_cloud"] = point_cloud
 
     def add_object_grasp(self, obj_id, plan: Pose, quality):
-        print("add object grasp: ", obj_id)
+        print("添加抓取到物体: ", obj_id)
         if obj_id not in self.obj_dict:
             raise Exception
-        if self.obj_dict[obj_id].get("grasp_plans") is not None:
-            self.obj_dict[obj_id]["grasp_plans"].append((plan, quality))
+        self.obj_dict[obj_id]["grasp_plans"].append((plan, quality))
+        obj_type = self.obj_dict[obj_id]["obj_type"]
+        if obj_type in self.grasp_type_count:
+            self.grasp_type_count[obj_type] += 1
         else:
-            self.obj_dict[obj_id]["grasp_plans"] = []
-            obj_type = self.obj_dict[obj_id]["obj_type"]
-            if obj_type in self.grasp_type_count:
-                self.grasp_type_count[obj_type] += 1
-            else:
-                self.grasp_type_count[obj_type] = 0
+            self.grasp_type_count[obj_type] = 1
 
     def merge_object_pointcloud(self, point_cloud, obj_type):
-        print("merge object pointcloud: ", obj_type)
+        print("融合类型为", obj_type,"的物体点云")
         match_found = False
         for obj_id, obj_info in self.obj_dict.items():
             if obj_info.get("obj_type") != obj_type:
@@ -72,20 +69,20 @@ class ObjectInfo:
                     [obj_point_cloud, point_cloud]
                 )
                 match_found = True
-                print("merge object match: ", obj_id)
+                print("融合到匹配的物体: ", obj_id)
                 break
         if not match_found:
             obj_id = 1
             while obj_id in self.obj_dict:
                 obj_id += 1
-            print("merge not match, new object: ", obj_id)
+            print("融合未匹配，新建物体: ", obj_id)
             self.new_object(obj_id, obj_type)
             self.add_object_pointcloud(obj_id, point_cloud)
 
     def get_best_grasp_plan_and_remove(
         self, obj_type
     ) -> tuple[Pose | None, npt.NDArray | None]:
-        print("get best grasp plan and remove: ", obj_type)
+        print("获取最佳抓取并移除一个类型为", obj_type,"的物体")
         best_quality = 0
         best_plan = None
         best_obj_id = None
@@ -119,7 +116,7 @@ class ObjectInfo:
             distances, _ = (
                 NearestNeighbors(n_neighbors=1)
                 .fit(obj_point_cloud)
-                .kneighbors(position)
+                .kneighbors(np.expand_dims(position,0))
             )
             if np.min(distances) < 10:
                 return obj_id
@@ -128,7 +125,7 @@ class ObjectInfo:
     def get_point_cloud(self, obj_id):
         if obj_id not in self.obj_dict:
             return None
-        return self.obj_dict[obj_id]["point_cloud"]
+        return self.obj_dict[obj_id].get("point_cloud")
 
     def is_empty(self):
         sum = 0
@@ -138,3 +135,16 @@ class ObjectInfo:
 
     def clear_all(self):
         self.obj_dict = {}
+
+    def __str__(self) -> str:
+        str=""
+        for obj_id, obj_info in self.obj_dict.items():
+            str+=f"obj_id: {obj_id}, obj_type: {obj_info['obj_type']}\n"
+            str+=f"grasps:"
+            grasps=obj_info.get('grasp_plans')
+            for grasp in grasps:
+                str+=f"(g,q={grasp[1]:.3f})"
+            str+="\n"
+        str+=f"grasp_type_count: {self.grasp_type_count}\n"
+        str+=f"roi_center: {self.roi_center}\n"
+        return str

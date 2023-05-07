@@ -16,8 +16,7 @@ from ssim import SSIM
 import trans_util
 from obj_info import ObjectInfo
 from ros_interface import ROSInterface
-from grcnn.msg import GraspCandidateWithIdx
-from vgn.msg import GraspCandidate
+import grcnn.msg,vgn.msg
 
 
 class Init(smach.State):
@@ -30,7 +29,8 @@ class Init(smach.State):
         rospy.set_param("/place_pose", [0.0, -0.5, 0.02, 0.0, 180.0, 180.0])
 
     def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        # ROSInterface().clear_markers()
         # 为下一个状态初始化数据
         userdata.retry_count = 0
         userdata.look_count = 0
@@ -42,7 +42,7 @@ class Look(smach.State):
         smach.State.__init__(
             self,
             outcomes=["enough", "not_enough", "aborted"],
-            output_keys=["init_picture"],
+            output_keys=["init_picture","obj_mask"],
             io_keys=["retry_count", "cam_poses"],
         )
 
@@ -85,6 +85,7 @@ class Look(smach.State):
             seg_out, depth.astype(np.float32) / 1000
         )
         objects_mask = np.where(seg_out != 0)
+        rospy.logdebug(f"获取物体信息：分割得到{len(seg_resp.classes)-1}个实例")
         return (
             rgb_msg,
             depth_msg,
@@ -95,26 +96,6 @@ class Look(smach.State):
             instance_pointclouds,
             objects_mask,
         )
-
-    def _execute(self, userdata):
-        raise Exception
-
-    def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
-        for _ in range(1):
-            try:
-                res = self._execute(userdata)
-            except rospy.ROSException as e:
-                rospy.logerr(e)
-            except rospy.ServiceException as e:
-                rospy.logerr(e)
-            else:
-                rospy.logdebug(
-                    f"obj after look, dict: {ObjectInfo().obj_dict} count: {ObjectInfo().obj_dict}"
-                )
-                return res
-        return "aborted"
-
 
 class LookDown(Look):
     @staticmethod
@@ -128,14 +109,14 @@ class LookDown(Look):
         max_point = np.max(points, axis=0)
         # TODO 移动到桌面上方
         center = (min_point + max_point) / 2
-        print(f"roi_center_point: {center}")
+        rospy.logdebug(f"roi_center_point: {center}")
         return center
 
     @staticmethod
     def cal_cam_poses(center, count) -> list[Pose]:
         # 定义相机的固定仰角和相机距离
-        elevation = math.radians(30)  # 基准点到相机连线与平面法向量的夹角
-        distance = 0.75
+        elevation = math.radians(40)  # 基准点到相机连线与平面法向量的夹角
+        distance = 0.3
 
         # 生成等间隔的方位角
         azimuths = [math.radians(i * 360 / count) for i in range(count)]
@@ -151,20 +132,20 @@ class LookDown(Look):
             right = np.cross(direction, up)
             up_new = np.cross(right, direction)
             direction_norm = direction / np.linalg.norm(direction)  # z
-            right_norm = right / np.linalg.norm(right)  # y
-            up_norm = up_new / np.linalg.norm(up_new)  # x
+            up_norm = up_new / np.linalg.norm(up_new)  # -y
+            right_norm = right / np.linalg.norm(right)  # x
 
             pose_mat = np.eye(4)
             pose_mat[:3, 3] = [x, y, z]
-            pose_mat[:3, 0] = up_norm
-            pose_mat[:3, 1] = right_norm
+            pose_mat[:3, 0] = right_norm
+            pose_mat[:3, 1] = -up_norm
             pose_mat[:3, 2] = direction_norm
             pose = trans_util.matrix_to_pose_msg(pose_mat)
             poses.append(pose)
-        rospy.logdebug(f"cam poses to: {poses}")
         return poses
 
-    def _execute(self, userdata):
+    def execute(self, userdata):
+        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
         (
             rgb_msg,
             depth_msg,
@@ -176,6 +157,7 @@ class LookDown(Look):
             objects_mask,
         ) = self.get_object_information()
         userdata.init_picture = rgb
+        userdata.obj_mask=np.zeros_like(rgb,dtype=bool)
         for i in range(len(instance_pointclouds)):
             ObjectInfo().new_object(i + 1, seg_resp.classes[i + 1])
             mask = np.zeros_like(rgb, dtype=bool)
@@ -184,36 +166,58 @@ class LookDown(Look):
             ObjectInfo().add_object_pointcloud(i + 1, instance_pointclouds[i + 1])
 
         resp = ROSInterface().grcnn(rgb_msg, depth_msg, seg_resp.seg)
-        grasps: list[GraspCandidateWithIdx] = resp.grasps
-        rospy.logdebug(f"grcnn grasps in depth: {grasps}")
-        transform = ROSInterface().lookup("depth", "elfin_base_link")
+        grasps: list[grcnn.msg.GraspCandidate] = resp.grasps
+        transform=ROSInterface().lookup("elfin_base_link", "depth")
         for grasp in grasps:
             new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
             ObjectInfo().add_object_grasp(grasp.inst_id, new_pose, grasp.quality)
             ROSInterface().draw_grasp(new_pose, grasp.quality)
+        rospy.logdebug(f"obj after LookDown:\n{ObjectInfo()}")
         # return "enough"#DEBUG
-        if depth[objects_mask].max() - depth[objects_mask].min() > 100:
+        if depth[objects_mask].max() - depth[objects_mask].min() > 10:
             roi_center = self.get_roi_center(instance_pointclouds)
             roi_center = ROSInterface().cam_point_to_base(roi_center)
             rospy.logdebug(f"roi base in elfin_base_link: {roi_center}")
-            ROSInterface().pub_tsdf_base(roi_center)
+            ROSInterface().pub_tsdf_base(roi_center,0.3)
+            ROSInterface().draw_roi("tsdf_base", 0.3)
             ObjectInfo().roi_center = roi_center
 
             ROSInterface().integrate_tsdf(depth_msg)
             userdata.cam_poses = self.cal_cam_poses(roi_center, 4)
-            rospy.logdebug(f"cam poses: {userdata.cam_poses}")
+            # rospy.logdebug(f"cam poses: {userdata.cam_poses}")
             for cam in userdata.cam_poses:
                 ROSInterface().draw_cam(cam)
+                time.sleep(.1)#否则有可能不显示
             return "not_enough"
         else:
             return "enough"
 
 
 class LookSide(Look):
-    def _execute(self, userdata):
+    def execute(self, userdata):
+        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        if len(userdata.cam_poses) == 0:
+            resp = ROSInterface().vgn_predict()
+            grasps: list[vgn.msg.GraspCandidate] = resp.grasps
+            rospy.logdebug(f"vgn grasps: {grasps}")
+            transform = ROSInterface().lookup("tsdf_base", "elfin_base_link")
+            for grasp in grasps:
+                position = ros_numpy.numpify(grasp.pose.position)
+                obj_id = ObjectInfo().find_object_by_position(position)
+                new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
+                ObjectInfo().add_object_grasp(obj_id, new_pose, grasp.quality)
+                ROSInterface().draw_grasp(new_pose, grasp.quality)
+            return "enough"
         pos = userdata.cam_poses.pop()
-        rospy.logdebug(f"move cam to: {pos}")
-        ROSInterface().move_cam(pos)
+        # rospy.logdebug(f"移动相机到: {pos}")
+        try:
+            resp=ROSInterface().move_cam(pos)
+        except Exception as e:
+            rospy.logerr(f"调用移动相机服务失败:{e}")
+            return "not_enough"
+        if resp.result==False:
+            rospy.logerr(f"移动相机失败,目标:{pos}")
+            return "not_enough"
         (
             _,
             depth_msg,
@@ -225,22 +229,12 @@ class LookSide(Look):
             _,
         ) = self.get_object_information()
         ROSInterface().integrate_tsdf(depth_msg)
-        for i in range(len(seg_resp.classes)):
+        for i in range(len(seg_resp.classes)-1):
+            rospy.logdebug(f"merge {i} object: {seg_resp.classes[i]}")
             ObjectInfo().merge_object_pointcloud(
-                instance_pointclouds[i], seg_resp.classes[i]
+                instance_pointclouds[i+1], seg_resp.classes[i+1]
             )
-        if len(userdata.cam_poses) == 0:
-            resp = ROSInterface().vgn_predict()
-            grasps: list[GraspCandidate] = resp.grasps
-            rospy.logdebug(f"vgn grasps: {grasps}")
-            transform = ROSInterface().lookup("tsdf_base", "elfin_base_link")
-            for grasp in grasps:
-                position = ros_numpy.numpify(grasp.pose.position)
-                obj_id = ObjectInfo().find_object_by_position(position)
-                new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
-                ObjectInfo().add_object_grasp(obj_id, new_pose, grasp.quality)
-                ROSInterface().draw_grasp(new_pose, grasp.quality)
-            return "enough"
+        rospy.logdebug(f"obj after LookSide:\n{ObjectInfo()}")
         return "not_enough"
 
 
@@ -248,7 +242,8 @@ class Pnp(smach.State):
     def __init__(self):
         smach.State.__init__(
             self,
-            outcomes=["successed", "failed"],
+            outcomes=["successed", "failed","aborted"],
+            input_keys=["perfer_type","obj_mask" ],
             output_keys=["obj_mask", "fail_counter", "fail_location"],
         )
 
@@ -260,7 +255,7 @@ class Pnp(smach.State):
                 target_type = type
                 break
         rospy.logdebug(f"target_type: {target_type}")
-        rospy.set_param("pick_and_place/object_type", target_type)
+        # rospy.set_param("pick_and_place/object_type", target_type)
         grasp, removed_obj_mask = ObjectInfo().get_best_grasp_plan_and_remove(
             target_type
         )
@@ -268,11 +263,16 @@ class Pnp(smach.State):
             return "failed"
         rospy.logdebug(f"grasp: {grasp}")
         userdata.obj_mask += removed_obj_mask
-        rospy.logdebug(f"userdata.obj_mask: {userdata.obj_mask}")
-        resp = ROSInterface().pnp(grasp)
+        # rospy.logdebug(f"userdata.obj_mask: {userdata.obj_mask}")
+        try:
+            resp = ROSInterface().pnp(grasp)
+        except Exception as e:
+            rospy.logerr(f"调用抓取服务失败:{e}")
+            return "aborted"
         if resp.result:
             return "successed"
         else:
+            rospy.logerr(f"抓取中途掉落")
             userdata.fail_counter = 1
             # userdata.fail_location = resp.fail_location
             return "failed"
@@ -322,7 +322,7 @@ class FailHandler(smach.State):
         if userdata.fail_counter > 3:
             return "failed"
         userdata.fail_counter += 1
-        distance = __class__.calc_fail_distnce(userdata.fail_location)
+        distance = self.calc_fail_distnce(userdata.fail_location)
         if distance > 100:
             return "far"
         else:
