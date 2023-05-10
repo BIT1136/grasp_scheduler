@@ -5,6 +5,7 @@ import numpy as np
 import numpy.typing as npt
 from PIL import Image
 from scipy.spatial.transform import Rotation
+from skimage import metrics, transform
 
 import rospy
 import ros_numpy
@@ -16,7 +17,7 @@ from ssim import SSIM
 import trans_util
 from obj_info import ObjectInfo
 from ros_interface import ROSInterface
-import grcnn.msg,vgn.msg
+import grcnn.msg, vgn.msg
 
 
 class Init(smach.State):
@@ -24,7 +25,7 @@ class Init(smach.State):
         smach.State.__init__(
             self,
             outcomes=["found", "not_found"],
-            output_keys=["retry_count", "look_count"],
+            output_keys=["look_count"],
         )
         rospy.set_param("/place_pose", [0.0, -0.5, 0.02, 0.0, 180.0, 180.0])
 
@@ -32,7 +33,6 @@ class Init(smach.State):
         # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
         # ROSInterface().clear_markers()
         # 为下一个状态初始化数据
-        userdata.retry_count = 0
         userdata.look_count = 0
         return "found"
 
@@ -42,25 +42,28 @@ class Look(smach.State):
         smach.State.__init__(
             self,
             outcomes=["enough", "not_enough", "aborted"],
-            output_keys=["init_picture","obj_mask"],
-            io_keys=["retry_count", "cam_poses"],
+            output_keys=["init_picture", "removed_mask"],
+            io_keys=["cam_poses"],
         )
 
     @staticmethod
-    def extract_instance_pointclouds(seg, depth):
+    def extract_instance_pointclouds(seg, depth) -> dict[int, npt.NDArray[np.float32]]:
         rows, cols = seg.shape
-        pixel_indices = np.indices((rows, cols)).reshape(2, -1)
-        pixel_indices = np.concatenate(
-            (pixel_indices, np.ones((1, pixel_indices.shape[1]))), axis=0
-        )
-        points = (
-            np.linalg.inv(ROSInterface().intrinsic.as_matrix())
-            @ pixel_indices
-            * depth.reshape(1, -1)
-        )
-        points = points[:3, :].T
+        fx = ROSInterface().intrinsic.fx
+        fy = ROSInterface().intrinsic.fy
+        cx = ROSInterface().intrinsic.cx
+        cy = ROSInterface().intrinsic.cy
 
-        instance_pointclouds = {}  # int->array(N,3)
+        # 生成相机坐标系下的网格点
+        u, v = np.meshgrid(np.arange(cols), np.arange(rows))
+        x = (u - cx) * depth / fx
+        y = (v - cy) * depth / fy
+        z = depth
+
+        # 将网格点展开成点云
+        points = np.stack([x.reshape(-1), y.reshape(-1), z.reshape(-1)], axis=1)
+
+        instance_pointclouds = {}
         for i in range(rows):
             for j in range(cols):
                 instance_id = seg[i, j]
@@ -69,22 +72,29 @@ class Look(smach.State):
                 if instance_id not in instance_pointclouds:
                     instance_pointclouds[instance_id] = []
                 instance_pointclouds[instance_id].append(points[i * cols + j])
+        # int->[array(3),array(3),...]
 
         for instance_id in instance_pointclouds:
             instance_pointclouds[instance_id] = np.array(
                 instance_pointclouds[instance_id]
             )
-        return instance_pointclouds
+            rospy.logdebug(f"转换点云坐标系{instance_id}")
+            instance_pointclouds[instance_id] = ROSInterface().cam_pc_to_base(
+                instance_pointclouds[instance_id]
+            )
+        return instance_pointclouds  # int->array(N,3)
 
     @staticmethod
     def get_object_information():
-        rgb_msg, depth_msg, rgb, depth = ROSInterface.intercept_image()
+        rgb_msg, depth_msg, rgb, depth = ROSInterface().intercept_image()
         seg_resp = ROSInterface().seg(rgb_msg)
         seg_out: npt.NDArray[np.uint8] = ros_numpy.numpify(seg_resp.seg)
         instance_pointclouds = __class__.extract_instance_pointclouds(
             seg_out, depth.astype(np.float32) / 1000
         )
-        objects_mask = np.where(seg_out != 0)
+        obj_mask_coord = np.where(seg_out != 0)
+        obj_mask = np.zeros_like(depth, dtype=bool)
+        obj_mask[obj_mask_coord] = True
         rospy.logdebug(f"获取物体信息：分割得到{len(seg_resp.classes)-1}个实例")
         return (
             rgb_msg,
@@ -94,38 +104,43 @@ class Look(smach.State):
             seg_resp,
             seg_out,
             instance_pointclouds,
-            objects_mask,
+            obj_mask,  # 有物体的像素为True
         )
+
 
 class LookDown(Look):
     @staticmethod
     def get_roi_center(instance_pointclouds: dict):
-        """获取roi的中心点在depth下的坐标"""
+        """获取roi的中心点在相机下的坐标"""
         points = []
         for i in instance_pointclouds.values():
             points.append(i)
         points = np.vstack(points)
         min_point = np.min(points, axis=0)
         max_point = np.max(points, axis=0)
+        print(min_point, max_point)
         # TODO 移动到桌面上方
         center = (min_point + max_point) / 2
-        rospy.logdebug(f"roi_center_point: {center}")
+        rospy.logdebug(f"获取roi的中心点在相机下的坐标: {center}")
         return center
 
     @staticmethod
     def cal_cam_poses(center, count) -> list[Pose]:
         # 定义相机的固定仰角和相机距离
-        elevation = math.radians(40)  # 基准点到相机连线与平面法向量的夹角
-        distance = 0.3
+        elevation = math.radians(30)  # 基准点到相机连线与平面法向量的夹角
+        distance = 0.4
+        z_bias = -0.1
+
+        avoid_arm = 0.5 if count % 2 == 0 else 0
 
         # 生成等间隔的方位角
-        azimuths = [math.radians(i * 360 / count) for i in range(count)]
+        azimuths = [math.radians((i + avoid_arm) * 360 / count) for i in range(count)]
 
         poses = []
         for azimuth in azimuths:
             x = center[0] + distance * math.sin(elevation) * math.cos(azimuth)
             y = center[1] + distance * math.sin(elevation) * math.sin(azimuth)
-            z = center[2] + distance * math.cos(elevation)
+            z = center[2] + distance * math.cos(elevation) + z_bias
 
             direction = np.array([center[0] - x, center[1] - y, center[2] - z])
             up = np.array([0, 0, 1])
@@ -156,38 +171,45 @@ class LookDown(Look):
             instance_pointclouds,
             objects_mask,
         ) = self.get_object_information()
+        if len(seg_resp.classes) == 1:
+            rospy.logerr("LookDown没有检测到物体,退出")
+            return "aborted"
+        np.save("/home/yangzhuo/grasp/rgb.npy", rgb)
         userdata.init_picture = rgb
-        userdata.obj_mask=np.zeros_like(rgb,dtype=bool)
+        userdata.removed_mask = np.zeros_like(depth, dtype=bool)  # 已移除物体对应像素为True
+        ROSInterface().pub_objmask(np.zeros_like(depth, dtype=bool))
         for i in range(len(instance_pointclouds)):
             ObjectInfo().new_object(i + 1, seg_resp.classes[i + 1])
-            mask = np.zeros_like(rgb, dtype=bool)
+            mask = np.zeros_like(depth, dtype=bool)
             mask[np.where(seg_out == i + 1)] = True
             ObjectInfo().add_object_mask(i + 1, mask)
             ObjectInfo().add_object_pointcloud(i + 1, instance_pointclouds[i + 1])
 
         resp = ROSInterface().grcnn(rgb_msg, depth_msg, seg_resp.seg)
         grasps: list[grcnn.msg.GraspCandidate] = resp.grasps
-        transform=ROSInterface().lookup("elfin_base_link", "depth")
+        transform = ROSInterface().lookup_cam_to_base()
         for grasp in grasps:
             new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
             ObjectInfo().add_object_grasp(grasp.inst_id, new_pose, grasp.quality)
             ROSInterface().draw_grasp(new_pose, grasp.quality)
-        rospy.logdebug(f"obj after LookDown:\n{ObjectInfo()}")
+        rospy.logdebug(f"LookDown后物体信息:\n{ObjectInfo()}")
+        pcs = ObjectInfo().get_all_pc()
+        ROSInterface().pub_objpc2(pcs)
         # return "enough"#DEBUG
-        if depth[objects_mask].max() - depth[objects_mask].min() > 10:
+        if depth[objects_mask].max() - depth[objects_mask].min() > 100:
             roi_center = self.get_roi_center(instance_pointclouds)
-            roi_center = ROSInterface().cam_point_to_base(roi_center)
-            rospy.logdebug(f"roi base in elfin_base_link: {roi_center}")
-            ROSInterface().pub_tsdf_base(roi_center,0.3)
+            # roi_center = ROSInterface().cam_point_to_base(roi_center)
+            rospy.logdebug(f"基坐标系下的tsdf基坐标: {roi_center}")
+            ROSInterface().pub_tsdf_base(roi_center, 0.3)
             ROSInterface().draw_roi("tsdf_base", 0.3)
             ObjectInfo().roi_center = roi_center
 
             ROSInterface().integrate_tsdf(depth_msg)
-            userdata.cam_poses = self.cal_cam_poses(roi_center, 4)
+            userdata.cam_poses = self.cal_cam_poses(roi_center, 2)
             # rospy.logdebug(f"cam poses: {userdata.cam_poses}")
             for cam in userdata.cam_poses:
                 ROSInterface().draw_cam(cam)
-                time.sleep(.1)#否则有可能不显示
+                time.sleep(0.1)  # 否则有可能不显示
             return "not_enough"
         else:
             return "enough"
@@ -199,23 +221,29 @@ class LookSide(Look):
         if len(userdata.cam_poses) == 0:
             resp = ROSInterface().vgn_predict()
             grasps: list[vgn.msg.GraspCandidate] = resp.grasps
-            rospy.logdebug(f"vgn grasps: {grasps}")
-            transform = ROSInterface().lookup("tsdf_base", "elfin_base_link")
+            # rospy.logdebug(f"vgn grasps: {grasps}")
+            transform = ROSInterface().lookup_tsdf_to_base()
             for grasp in grasps:
-                position = ros_numpy.numpify(grasp.pose.position)
-                obj_id = ObjectInfo().find_object_by_position(position)
                 new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
+                position = ros_numpy.numpify(new_pose.position)
+                obj_id = ObjectInfo().find_object_by_position(position)
+                if obj_id is None:
+                    rospy.logwarn(f"无法找到抓取位置{position}对应的物体,丢弃")
+                    continue
+                new_pose = trans_util.forward_pose(
+                    new_pose, 0.05
+                )  # 将夹爪位置沿z轴推进，因为vgn定义的位置在夹爪根部
                 ObjectInfo().add_object_grasp(obj_id, new_pose, grasp.quality)
                 ROSInterface().draw_grasp(new_pose, grasp.quality)
             return "enough"
         pos = userdata.cam_poses.pop()
         # rospy.logdebug(f"移动相机到: {pos}")
         try:
-            resp=ROSInterface().move_cam(pos)
+            resp = ROSInterface().move_cam(pos)
         except Exception as e:
             rospy.logerr(f"调用移动相机服务失败:{e}")
             return "not_enough"
-        if resp.result==False:
+        if resp.result == False:
             rospy.logerr(f"移动相机失败,目标:{pos}")
             return "not_enough"
         (
@@ -229,12 +257,14 @@ class LookSide(Look):
             _,
         ) = self.get_object_information()
         ROSInterface().integrate_tsdf(depth_msg)
-        for i in range(len(seg_resp.classes)-1):
+        for i in range(len(seg_resp.classes) - 1):
             rospy.logdebug(f"merge {i} object: {seg_resp.classes[i]}")
             ObjectInfo().merge_object_pointcloud(
-                instance_pointclouds[i+1], seg_resp.classes[i+1]
+                instance_pointclouds[i + 1], seg_resp.classes[i + 1]
             )
-        rospy.logdebug(f"obj after LookSide:\n{ObjectInfo()}")
+        rospy.logdebug(f"LookSide后物体信息:\n{ObjectInfo()}")
+        pcs = ObjectInfo().get_all_pc()
+        ROSInterface().pub_objpc2(pcs)
         return "not_enough"
 
 
@@ -242,34 +272,39 @@ class Pnp(smach.State):
     def __init__(self):
         smach.State.__init__(
             self,
-            outcomes=["successed", "failed","aborted"],
-            input_keys=["perfer_type","obj_mask" ],
-            output_keys=["obj_mask", "fail_counter", "fail_location"],
+            outcomes=["successed", "failed", "aborted", "finished"],
+            input_keys=["perfer_type"],
+            output_keys=["fail_counter", "fail_location"],
+            io_keys=["removed_mask"],
         )
 
     def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
         target_type = 0
         for type in userdata.perfer_type:
-            if ObjectInfo().grasp_type_count[type] > 0:
-                target_type = type
-                break
-        rospy.logdebug(f"target_type: {target_type}")
+            if type in ObjectInfo().grasp_type_count:
+                if ObjectInfo().grasp_type_count[type] > 0:
+                    target_type = type
+                    break
+        if target_type == 0:
+            return "finished"
+        rospy.logdebug(f"抓取目标类型: {target_type}")
         # rospy.set_param("pick_and_place/object_type", target_type)
         grasp, removed_obj_mask = ObjectInfo().get_best_grasp_plan_and_remove(
             target_type
         )
         if grasp is None:
             return "failed"
-        rospy.logdebug(f"grasp: {grasp}")
-        userdata.obj_mask += removed_obj_mask
-        # rospy.logdebug(f"userdata.obj_mask: {userdata.obj_mask}")
+        rospy.logdebug(f"最佳抓取: {grasp}")
+        userdata.removed_mask += removed_obj_mask
+        ROSInterface().pub_objmask(userdata.removed_mask)
         try:
             resp = ROSInterface().pnp(grasp)
         except Exception as e:
             rospy.logerr(f"调用抓取服务失败:{e}")
             return "aborted"
         if resp.result:
+            rospy.logdebug(f"Pnp后物体信息:\n{ObjectInfo()}")
             return "successed"
         else:
             rospy.logerr(f"抓取中途掉落")
@@ -282,20 +317,30 @@ class FindChange(smach.State):
     def __init__(self):
         smach.State.__init__(
             self,
-            outcomes=["change", "no_change", "empty"],
-            input_keys=["init_picture", "obj_mask"],
+            outcomes=["change", "no_change"],
+            input_keys=["init_picture", "removed_mask"],
         )
 
     def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
-        init_pic = userdata.init_picture * (1 - userdata.obj_mask)
-        init_pic = Image.fromarray(init_pic, mode="RGB")
-        _, _, pic, _ = ROSInterface.intercept_image()
-        pic *= 1 - userdata.obj_mask
-        now_picture = Image.fromarray(pic, mode="RGB")
-        ssim = SSIM(init_pic)
-        ssim_value = ssim.cw_ssim_value(now_picture)
-        rospy.logdebug(f"ssim value: {ssim_value}")
+        rgbmask = (
+            np.expand_dims(userdata.removed_mask, axis=2)
+            .repeat(3, axis=2)
+            .astype(np.uint8)
+        )
+        init_pic = userdata.init_picture * (1 - rgbmask)
+        _, _, pic, _ = ROSInterface().intercept_image()
+        pic *= 1 - rgbmask
+        type = pic.dtype
+        init_pic = transform.resize(
+            init_pic,
+            (init_pic.shape[0] / 2, init_pic.shape[1] / 2),
+            preserve_range=True,
+        ).astype(type)
+        pic = transform.resize(
+            pic, (pic.shape[0] / 2, pic.shape[1] / 2), preserve_range=True
+        ).astype(type)
+        ssim_value = metrics.structural_similarity(init_pic, pic, channel_axis=2)
+        rospy.logdebug(f"ssim值:{ssim_value}")
         if ssim_value < 0.8:
             ROSInterface().clear_markers()
             return "change"

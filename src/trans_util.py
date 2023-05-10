@@ -76,3 +76,11 @@ def apply_trans_to_pose(transform: Transform, pose: Pose) -> Pose:
     p_m = pose_msg_to_matrix(pose)
     np_m = np.dot(t_m, p_m)
     return matrix_to_pose_msg(np_m)
+
+
+def forward_pose(pose, length) -> Pose:
+    pose_mat = pose_msg_to_matrix(pose)
+    point = np.dot(pose_mat, np.array([0.0, 0.0, length, 1]))
+    new_pose_mat = pose_mat.copy()
+    new_pose_mat[:3, 3] = point[:3]
+    return matrix_to_pose_msg(new_pose_mat)
