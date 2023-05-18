@@ -13,11 +13,18 @@ import smach
 from geometry_msgs.msg import Pose
 
 import grasp_scheduler
-from ssim import SSIM
 import trans_util
 from obj_info import ObjectInfo
 from ros_interface import ROSInterface
 import grcnn.msg, vgn.msg
+
+
+hold = True
+state_start = (
+    lambda: None
+    if not hold
+    else (None if input("continue? [y/N]") == "y" else rospy.signal_shutdown(""))
+)
 
 
 class Init(smach.State):
@@ -30,8 +37,7 @@ class Init(smach.State):
         rospy.set_param("/place_pose", [0.0, -0.5, 0.02, 0.0, 180.0, 180.0])
 
     def execute(self, userdata):
-        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
-        # ROSInterface().clear_markers()
+        # state_start
         # 为下一个状态初始化数据
         userdata.look_count = 0
         return "found"
@@ -48,6 +54,11 @@ class Look(smach.State):
 
     @staticmethod
     def extract_instance_pointclouds(seg, depth) -> dict[int, npt.NDArray[np.float32]]:
+        rospy.logdebug(f"从{seg.max()}个实例中提取点云")
+        # print(len(np.where(seg==1)[0]))
+        # print(len(np.where(seg==2)[0]))
+        # print(len(np.where(seg==3)[0]))
+        # 提取实例点云转换到基坐标系下
         rows, cols = seg.shape
         fx = ROSInterface().intrinsic.fx
         fy = ROSInterface().intrinsic.fy
@@ -70,15 +81,18 @@ class Look(smach.State):
                 if instance_id == 0:
                     continue
                 if instance_id not in instance_pointclouds:
+                    rospy.logdebug(f"发现实例id: {instance_id}")
                     instance_pointclouds[instance_id] = []
                 instance_pointclouds[instance_id].append(points[i * cols + j])
         # int->[array(3),array(3),...]
 
-        for instance_id in instance_pointclouds:
+        for instance_id in instance_pointclouds.keys():
             instance_pointclouds[instance_id] = np.array(
                 instance_pointclouds[instance_id]
             )
-            rospy.logdebug(f"转换点云坐标系{instance_id}")
+            rospy.logdebug(
+                f"实例id={instance_id}点云数量: {len(instance_pointclouds[instance_id])}"
+            )
             instance_pointclouds[instance_id] = ROSInterface().cam_pc_to_base(
                 instance_pointclouds[instance_id]
             )
@@ -128,7 +142,7 @@ class LookDown(Look):
     def cal_cam_poses(center, count) -> list[Pose]:
         # 定义相机的固定仰角和相机距离
         elevation = math.radians(30)  # 基准点到相机连线与平面法向量的夹角
-        distance = 0.4
+        distance = 0.5
         z_bias = -0.1
 
         avoid_arm = 0.5 if count % 2 == 0 else 0
@@ -140,7 +154,7 @@ class LookDown(Look):
         for azimuth in azimuths:
             x = center[0] + distance * math.sin(elevation) * math.cos(azimuth)
             y = center[1] + distance * math.sin(elevation) * math.sin(azimuth)
-            z = center[2] + distance * math.cos(elevation) + z_bias
+            z = center[2] + distance * math.cos(elevation)
 
             direction = np.array([center[0] - x, center[1] - y, center[2] - z])
             up = np.array([0, 0, 1])
@@ -151,7 +165,7 @@ class LookDown(Look):
             right_norm = right / np.linalg.norm(right)  # x
 
             pose_mat = np.eye(4)
-            pose_mat[:3, 3] = [x, y, z]
+            pose_mat[:3, 3] = [x, y, z + z_bias]
             pose_mat[:3, 0] = right_norm
             pose_mat[:3, 1] = -up_norm
             pose_mat[:3, 2] = direction_norm
@@ -160,7 +174,7 @@ class LookDown(Look):
         return poses
 
     def execute(self, userdata):
-        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        state_start
         (
             rgb_msg,
             depth_msg,
@@ -174,7 +188,7 @@ class LookDown(Look):
         if len(seg_resp.classes) == 1:
             rospy.logerr("LookDown没有检测到物体,退出")
             return "aborted"
-        np.save("/home/yangzhuo/grasp/rgb.npy", rgb)
+        # np.save("../tests/rgb.npy", rgb)
         userdata.init_picture = rgb
         userdata.removed_mask = np.zeros_like(depth, dtype=bool)  # 已移除物体对应像素为True
         ROSInterface().pub_objmask(np.zeros_like(depth, dtype=bool))
@@ -183,7 +197,9 @@ class LookDown(Look):
             mask = np.zeros_like(depth, dtype=bool)
             mask[np.where(seg_out == i + 1)] = True
             ObjectInfo().add_object_mask(i + 1, mask)
-            ObjectInfo().add_object_pointcloud(i + 1, instance_pointclouds[i + 1])
+            ObjectInfo().add_object_pointcloud(i + 1, instance_pointclouds.get(i + 1))
+        pcs = ObjectInfo().get_all_pc()
+        ROSInterface().pub_objpc2(pcs)
 
         resp = ROSInterface().grcnn(rgb_msg, depth_msg, seg_resp.seg)
         grasps: list[grcnn.msg.GraspCandidate] = resp.grasps
@@ -198,7 +214,6 @@ class LookDown(Look):
         # return "enough"#DEBUG
         if depth[objects_mask].max() - depth[objects_mask].min() > 100:
             roi_center = self.get_roi_center(instance_pointclouds)
-            # roi_center = ROSInterface().cam_point_to_base(roi_center)
             rospy.logdebug(f"基坐标系下的tsdf基坐标: {roi_center}")
             ROSInterface().pub_tsdf_base(roi_center, 0.3)
             ROSInterface().draw_roi("tsdf_base", 0.3)
@@ -217,13 +232,15 @@ class LookDown(Look):
 
 class LookSide(Look):
     def execute(self, userdata):
-        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        state_start
         if len(userdata.cam_poses) == 0:
             resp = ROSInterface().vgn_predict()
             grasps: list[vgn.msg.GraspCandidate] = resp.grasps
             # rospy.logdebug(f"vgn grasps: {grasps}")
             transform = ROSInterface().lookup_tsdf_to_base()
             for grasp in grasps:
+                # quality=grasp.quality*(0.7+grasp.pose.position.z)#VGN结果衰减
+                quality = grasp.quality
                 new_pose = trans_util.apply_trans_to_pose(transform, grasp.pose)
                 position = ros_numpy.numpify(new_pose.position)
                 obj_id = ObjectInfo().find_object_by_position(position)
@@ -233,8 +250,14 @@ class LookSide(Look):
                 new_pose = trans_util.forward_pose(
                     new_pose, 0.05
                 )  # 将夹爪位置沿z轴推进，因为vgn定义的位置在夹爪根部
-                ObjectInfo().add_object_grasp(obj_id, new_pose, grasp.quality)
-                ROSInterface().draw_grasp(new_pose, grasp.quality)
+                new_pose = trans_util.rot_z_90(
+                    new_pose
+                )  # 将姿势绕z轴旋转90度，因为vgn定义的姿势是右手指为y轴方向
+                ObjectInfo().add_object_grasp(obj_id, new_pose, quality)
+                ROSInterface().draw_grasp(new_pose, quality)
+            rospy.logdebug(f"LookSidePredict后物体信息:\n{ObjectInfo()}")
+            pcs = ObjectInfo().get_all_pc()
+            ROSInterface().pub_objpc2(pcs)
             return "enough"
         pos = userdata.cam_poses.pop()
         # rospy.logdebug(f"移动相机到: {pos}")
@@ -258,7 +281,8 @@ class LookSide(Look):
         ) = self.get_object_information()
         ROSInterface().integrate_tsdf(depth_msg)
         for i in range(len(seg_resp.classes) - 1):
-            rospy.logdebug(f"merge {i} object: {seg_resp.classes[i]}")
+            if instance_pointclouds.get(i + 1) is None:
+                continue
             ObjectInfo().merge_object_pointcloud(
                 instance_pointclouds[i + 1], seg_resp.classes[i + 1]
             )
@@ -278,19 +302,23 @@ class Pnp(smach.State):
             io_keys=["removed_mask"],
         )
 
-    def execute(self, userdata):
-        # None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+    def fine_target(self, perfer_type):
         target_type = 0
-        for type in userdata.perfer_type:
+        for type in perfer_type:
             if type in ObjectInfo().grasp_type_count:
                 if ObjectInfo().grasp_type_count[type] > 0:
                     target_type = type
                     break
+        return target_type
+
+    def execute(self, userdata):
+        state_start
+        target_type = self.fine_target(userdata.perfer_type)
         if target_type == 0:
             return "finished"
         rospy.logdebug(f"抓取目标类型: {target_type}")
         # rospy.set_param("pick_and_place/object_type", target_type)
-        grasp, removed_obj_mask = ObjectInfo().get_best_grasp_plan_and_remove(
+        grasp, plans, removed_obj_mask = ObjectInfo().get_best_grasp_plan_and_remove(
             target_type
         )
         if grasp is None:
@@ -305,6 +333,8 @@ class Pnp(smach.State):
             return "aborted"
         if resp.result:
             rospy.logdebug(f"Pnp后物体信息:\n{ObjectInfo()}")
+            if self.fine_target(userdata.perfer_type) == 0:
+                return "finished"
             return "successed"
         else:
             rospy.logerr(f"抓取中途掉落")
@@ -330,18 +360,18 @@ class FindChange(smach.State):
         init_pic = userdata.init_picture * (1 - rgbmask)
         _, _, pic, _ = ROSInterface().intercept_image()
         pic *= 1 - rgbmask
+        # np.save("../tests/init_pic.npy", init_pic)
+        # np.save("../tests/pic.npy", pic)
         type = pic.dtype
         init_pic = transform.resize(
             init_pic,
-            (init_pic.shape[0] / 2, init_pic.shape[1] / 2),
+            (200, 200, 3),
             preserve_range=True,
         ).astype(type)
-        pic = transform.resize(
-            pic, (pic.shape[0] / 2, pic.shape[1] / 2), preserve_range=True
-        ).astype(type)
+        pic = transform.resize(pic, (200, 200, 3), preserve_range=True).astype(type)
         ssim_value = metrics.structural_similarity(init_pic, pic, channel_axis=2)
-        rospy.logdebug(f"ssim值:{ssim_value}")
-        if ssim_value < 0.8:
+        rospy.logdebug(f"ssim值:{ssim_value}，{'改变' if ssim_value < 0.93 else '不变'}")
+        if ssim_value < 0.93:
             ROSInterface().clear_markers()
             return "change"
         else:
@@ -358,17 +388,19 @@ class FailHandler(smach.State):
 
     @staticmethod
     def calc_fail_distnce(location):
-        ObjectInfo().roi_center
-        location
-        return 0
+        obj = ObjectInfo().roi_center
+        obj[2] = 0
+        location[2] = 0
+        dist = np.linalg.norm(obj - location)
+        return dist
 
     def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        state_start
         if userdata.fail_counter > 3:
             return "failed"
         userdata.fail_counter += 1
         distance = self.calc_fail_distnce(userdata.fail_location)
-        if distance > 100:
+        if distance > 0.75:
             return "far"
         else:
             return "near"
@@ -396,11 +428,11 @@ class RetryPnp(smach.State):
     #     return pose
 
     def execute(self, userdata):
-        None if input("continue? [y/N]") == "y" else rospy.signal_shutdown("")
+        state_start
         # pose=__class__.look_fail_location(userdata.fail_location)
         # ROSInterface().move_cam(pose)
-        ROSInterface().look_down_now()
-        rgb_msg, depth_msg, _, _ = ROSInterface.intercept_image()
+        # ROSInterface().look_down_now()
+        rgb_msg, depth_msg, _, _ = ROSInterface().intercept_image()
         seg_resp = ROSInterface().seg(rgb_msg)
         resp = ROSInterface().grcnn(rgb_msg, depth_msg, seg_resp.seg)
         resp = ROSInterface().pnp(resp.grasps[0])

@@ -6,6 +6,7 @@ import struct
 import numpy as np
 import numpy.typing as npt
 from scipy.spatial.transform import Rotation
+from scipy import interpolate
 
 import rospy
 import ros_numpy
@@ -41,7 +42,10 @@ class ROSInterface:
 
         self.sim = True
 
-        self.cam_frame = "camera_pub_cloud_frame"
+        if self.sim:
+            self.cam_frame = "depth"
+        else:
+            self.cam_frame = "camera_registered_frame"
         self.base_frame = "elfin_base_link"
 
         self.seg: Callable[[Image], InstanceSegResponse] = rospy.ServiceProxy(
@@ -74,17 +78,39 @@ class ROSInterface:
         self.mask_pub = rospy.Publisher("object_mask", Image, queue_size=1)
         self.pc_pub = rospy.Publisher("object_pointcloud", PointCloud2, queue_size=1)
 
-        msg: CameraInfo = rospy.wait_for_message(
-            "/d435/camera/depth/camera_info", CameraInfo, 1
-        )
+        if self.sim:
+            msg: CameraInfo = rospy.wait_for_message(
+                "/d435/camera/depth/camera_info", CameraInfo, 1
+            )
+        else:
+            msg: CameraInfo = rospy.wait_for_message(
+                "/camera/color/camera_info", CameraInfo, 5
+            )
         self.intrinsic = CameraIntrinsic.from_camera_info(msg)
 
         self.tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         self.tf_broadcaster = tf2_ros.StaticTransformBroadcaster()
 
-    def set_sim(self, bool) -> None:
-        self.sim = bool
+    def restore_depth_image(self, depth_image):
+        rows, cols = depth_image.shape
+        y_coords, x_coords = np.mgrid[:rows, :cols]
+
+        known_values = depth_image[depth_image > 0]
+        known_coords = np.column_stack(
+            (x_coords[depth_image > 0], y_coords[depth_image > 0])
+        )
+        missing_coords = np.column_stack(
+            (x_coords[depth_image == 0], y_coords[depth_image == 0])
+        )
+        interpolated_values = interpolate.griddata(
+            known_coords, known_values, missing_coords, method="nearest"
+        )
+
+        restored_image = np.copy(depth_image)
+        restored_image[depth_image == 0] = interpolated_values
+
+        return restored_image
 
     def intercept_image(
         self,
@@ -93,10 +119,15 @@ class ROSInterface:
             rgb_msg = rospy.wait_for_message("/d435/camera/color/image_raw", Image, 1)
             depth_msg = rospy.wait_for_message("/d435/camera/depth/image_raw", Image, 1)
         else:
-            rgb_msg = rospy.wait_for_message("/camera/color/image_raw", Image, 1)
-            depth_msg = rospy.wait_for_message("/camera/depth/image_raw", Image, 1)
+            rgb_msg = rospy.wait_for_message("/camera/color/image_raw", Image, 20)
+            depth_msg = rospy.wait_for_message(
+                "/camera/color/image_depth_registered", Image, 20
+            )
         rgb_np = ros_numpy.numpify(rgb_msg)
+        if rgb_msg.encoding == "bgr8":
+            rgb_np = rgb_np[..., ::-1]
         depth_np = ros_numpy.numpify(depth_msg)
+        depth_np = self.restore_depth_image(depth_np)
         return rgb_msg, depth_msg, rgb_np, depth_np
 
     def lookup(self, target_frame, source_frame) -> Transform:

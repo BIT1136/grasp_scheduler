@@ -12,11 +12,10 @@ from ros_interface import ROSInterface
 
 
 class GraspSchedulerServer:
-    def __init__(self, sim=True) -> None:
+    def __init__(self) -> None:
         sm = smach.StateMachine(outcomes=["successed", "aborted"])
-        sm.userdata.perfer_type = [1, 2, 3]
+        sm.userdata.perfer_type = list(range(1, 91))
 
-        ROSInterface().set_sim(True)
         time.sleep(0.5)  # 否则无法清除rviz中的marker
         ROSInterface().clear_markers()
         ROSInterface().vgn_reset()

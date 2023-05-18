@@ -78,9 +78,17 @@ def apply_trans_to_pose(transform: Transform, pose: Pose) -> Pose:
     return matrix_to_pose_msg(np_m)
 
 
-def forward_pose(pose, length) -> Pose:
+def forward_pose(pose: Pose, length) -> Pose:
     pose_mat = pose_msg_to_matrix(pose)
     point = np.dot(pose_mat, np.array([0.0, 0.0, length, 1]))
     new_pose_mat = pose_mat.copy()
     new_pose_mat[:3, 3] = point[:3]
+    return matrix_to_pose_msg(new_pose_mat)
+
+
+def rot_z_90(pose: Pose) -> Pose:
+    pose_mat = pose_msg_to_matrix(pose)
+    rot_mat = Rotation.from_euler("z", 90, degrees=True).as_matrix()
+    new_pose_mat = pose_mat.copy()
+    new_pose_mat[:3, :3] = np.dot(rot_mat, pose_mat[:3, :3])
     return matrix_to_pose_msg(new_pose_mat)
