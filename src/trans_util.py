@@ -57,7 +57,7 @@ def matrix_to_transform_msg(tf_mat):
 
 
 def matrix_to_pose_msg(tf_mat):
-    """将变换矩阵转换为 ROS 的 Transform 消息"""
+    """将变换矩阵转换为 ROS 的 Pose 消息"""
     transform = Pose()
     # as_quat()->(x, y, z, w)
     translation = Rotation.from_matrix(tf_mat[:3, :3]).as_quat()

@@ -214,19 +214,6 @@ class ROSInterface:
         img[mask] = 255
         self.mask_pub.publish(ros_numpy.msgify(Image, img, encoding="mono8"))
 
-    def pub_objpc(self, pc):
-        points = []
-        for i in pc.values():
-            points.append(i)
-        points = np.vstack(points)
-        pc_msg = PointCloud()
-        pc_msg.header = Header()
-        pc_msg.header.stamp = rospy.Time.now()
-        pc_msg.header.frame_id = self.cam_frame
-        for i in range(points.shape[0]):
-            pc_msg.points.append(Point32(*points[i]))
-        self.pc_pub.publish(pc_msg)
-
     def pub_objpc2(self, pcs):
         print(f"共显示{len(pcs)}个点云,大小为{[len(i) for i in pcs]}")
         points = []

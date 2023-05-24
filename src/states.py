@@ -6,6 +6,7 @@ import numpy.typing as npt
 from PIL import Image
 from scipy.spatial.transform import Rotation
 from skimage import metrics, transform
+import matplotlib.pyplot as plt
 
 import rospy
 import ros_numpy
@@ -211,7 +212,7 @@ class LookDown(Look):
         rospy.logdebug(f"LookDown后物体信息:\n{ObjectInfo()}")
         pcs = ObjectInfo().get_all_pc()
         ROSInterface().pub_objpc2(pcs)
-        # return "enough"#DEBUG
+        return "enough"#DEBUG
         if depth[objects_mask].max() - depth[objects_mask].min() > 100:
             roi_center = self.get_roi_center(instance_pointclouds)
             rospy.logdebug(f"基坐标系下的tsdf基坐标: {roi_center}")
@@ -317,7 +318,8 @@ class Pnp(smach.State):
         if target_type == 0:
             return "finished"
         rospy.logdebug(f"抓取目标类型: {target_type}")
-        # rospy.set_param("pick_and_place/object_type", target_type)
+        place_type = 1 if target_type == 1 else 4
+        rospy.set_param("/pnp_service_node/object_type", place_type)
         grasp, plans, removed_obj_mask = ObjectInfo().get_best_grasp_plan_and_remove(
             target_type
         )
@@ -362,6 +364,14 @@ class FindChange(smach.State):
         pic *= 1 - rgbmask
         # np.save("../tests/init_pic.npy", init_pic)
         # np.save("../tests/pic.npy", pic)
+        plt.ion()
+        plt.figure()
+        plt.subplot(1,2,1)
+        plt.imshow(init_pic)
+        plt.subplot(1,2,2)
+        plt.imshow(pic)
+        # plt.ioff()
+        # plt.show()
         type = pic.dtype
         init_pic = transform.resize(
             init_pic,
@@ -370,8 +380,10 @@ class FindChange(smach.State):
         ).astype(type)
         pic = transform.resize(pic, (200, 200, 3), preserve_range=True).astype(type)
         ssim_value = metrics.structural_similarity(init_pic, pic, channel_axis=2)
-        rospy.logdebug(f"ssim值:{ssim_value}，{'改变' if ssim_value < 0.93 else '不变'}")
-        if ssim_value < 0.93:
+        rospy.logdebug(f"ssim值:{ssim_value}，{'改变' if ssim_value < 0.88 else '不变'}")
+        if ssim_value < 0.88:
+            np.save(f"../tests/init_pic{int(time.time())}.npy", init_pic)
+            np.save(f"../tests/pic{int(time.time())}.npy", pic)
             ROSInterface().clear_markers()
             return "change"
         else:
@@ -395,6 +407,7 @@ class FailHandler(smach.State):
         return dist
 
     def execute(self, userdata):
+        return "failed"
         state_start
         if userdata.fail_counter > 3:
             return "failed"
